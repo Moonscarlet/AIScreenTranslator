@@ -127,7 +127,7 @@ PERSISTENT_CONFIG = load_persistent_config()
 class Config:
     GEMINI_API_KEY: str = field(
         default_factory=lambda: os.environ.get(
-            "GEMINI_API_KEY", "AQ.Ab8RN6JFrDJATz9RmattP3TXEGZ-CrND1OaUsKtvf767Y_TwwA"
+            "GEMINI_API_KEY", "APIKEYHERE"
         )
     )
 
