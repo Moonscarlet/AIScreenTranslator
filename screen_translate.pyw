@@ -2,47 +2,51 @@
 """
 screen_translate.py
 ====================
-Background screen-capture translation tool.
+Background screen-capture translation tool supporting Gemini and Groq.
 
   F7                      -> interactive "freeze & snip" capture
   Ctrl + F7               -> instant capture of the saved preset box
   Ctrl + Alt + Shift + F7 -> interactive box selection to set & save preset area
 
-Overlay Controls:
-  - Left Mouse Drag: Select region
-  - Right Mouse Click / ESC: Cancel
-
 Config:
-  - Position, window size, preset coordinates, and font size are stored
-    in 'config.json' next to the script.
+  - Credentials and model priorities are loaded from '.env'
+  - Window position, size, and preset box are stored in 'config.json'
 """
 
 import os
 import sys
+import io
+import re
 import json
 import queue
+import base64
 import warnings
 import threading
 import traceback
 from dataclasses import dataclass, field
 from typing import Optional, Tuple, List
 
-# Suppress SDK Automatic Function Calling (AFC) warning
+# Suppress Gemini SDK Automatic Function Calling (AFC) warning
 warnings.filterwarnings("ignore", message=".*Direct use of automatic function calling.*")
 
-# Load .env file if available
+# ==========================================================================
+# LOAD .ENV FILE
+# ==========================================================================
+_env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
 try:
     from dotenv import load_dotenv
-    load_dotenv()
+    if os.path.exists(_env_path):
+        load_dotenv(_env_path, override=True)
+    else:
+        load_dotenv(override=True)
 except ImportError:
-    _env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
     if os.path.exists(_env_path):
         with open(_env_path, "r", encoding="utf-8") as _f:
             for _line in _f:
                 _line = _line.strip()
                 if _line and not _line.startswith("#") and "=" in _line:
                     _k, _v = _line.split("=", 1)
-                    os.environ.setdefault(_k.strip(), _v.strip("'\" "))
+                    os.environ[_k.strip()] = _v.strip("'\" ")
 
 import tkinter as tk
 from tkinter import ttk, scrolledtext
@@ -64,6 +68,11 @@ try:
 except ImportError:
     genai = None
     types = None
+
+try:
+    from groq import Groq
+except ImportError:
+    Groq = None
 
 try:
     import mss
@@ -95,7 +104,7 @@ def load_persistent_config() -> dict:
         try:
             with open(target_file, "r", encoding="utf-8") as f:
                 data = json.load(f)
-                if "x1" in data and "x2" in data:  # Legacy preset format migration
+                if "x1" in data and "x2" in data:
                     default_config["preset_coords"] = data
                 else:
                     if "preset_coords" in data and isinstance(data["preset_coords"], dict):
@@ -105,9 +114,8 @@ def load_persistent_config() -> dict:
                     if "result_font_size" in data and isinstance(data["result_font_size"], (int, float)):
                         default_config["result_font_size"] = int(data["result_font_size"])
         except Exception as e:
-            print(f"[WARN] Error loading config: {e}")
+            print(f"[WARN] Error loading config.json: {e}")
 
-    # Ensure config.json is created
     if not os.path.exists(CONFIG_FILE):
         save_persistent_config(default_config)
     return default_config
@@ -123,21 +131,60 @@ def save_persistent_config(data: dict):
 PERSISTENT_CONFIG = load_persistent_config()
 
 
+def _get_env_var(keys: List[str], default: str = "") -> str:
+    for k in keys:
+        for candidate in (k, k.lower(), k.upper()):
+            val = os.environ.get(candidate)
+            if val is not None and val.strip():
+                return val.strip()
+    return default
+
+
+def _parse_model_list(keys: List[str], default: List[str]) -> List[str]:
+    raw = _get_env_var(keys, "")
+    if raw:
+        items = [m.strip() for m in raw.split(",") if m.strip()]
+        if items:
+            return items
+    return default
+
+
 @dataclass
 class Config:
-    GEMINI_API_KEY: str = field(
-        default_factory=lambda: os.environ.get(
-            "GEMINI_API_KEY", "APIKEYHERE"
-        )
+    # "groq", "gemini", or "auto"
+    SERVICE: str = field(
+        default_factory=lambda: _get_env_var(["SERVICE", "SERVICE_NAME", "TRANSLATION_SERVICE"], "gemini").lower()
     )
 
-    GEMINI_MODELS: List[str] = field(default_factory=lambda: [
-        "gemini-flash-lite-latest",
-        "gemini-3.1-flash-lite",
-        "gemini-flash-latest",
-        "gemini-3.5-flash",
-        "gemini-3-flash-preview",
-    ])
+    # API Keys
+    GEMINI_API_KEY: str = field(
+        default_factory=lambda: _get_env_var(["GEMINI_API_KEY", "GEMINIAPIKEY"], "")
+    )
+    GROQ_API_KEY: str = field(
+        default_factory=lambda: _get_env_var(["GROQ_API_KEY", "GROQAPIKEY"], "")
+    )
+
+    # Models
+    GEMINI_MODELS: List[str] = field(
+        default_factory=lambda: _parse_model_list(
+            ["GEMINI_MODELS", "GEMINIMODELS"],
+            [
+                "gemini-flash-lite-latest",
+                "gemini-3.1-flash-lite",
+                "gemini-flash-latest",
+                "gemini-2.5-flash",
+                "gemini-2.0-flash",
+            ]
+        )
+    )
+    GROQ_MODELS: List[str] = field(
+        default_factory=lambda: _parse_model_list(
+            ["GROQ_MODELS", "GROQMODELS"],
+            [
+                "qwen/qwen3.8-27b"
+            ]
+        )
+    )
 
     PRESET_COORDS: dict = field(default_factory=lambda: PERSISTENT_CONFIG["preset_coords"])
 
@@ -146,6 +193,7 @@ class Config:
     HOTKEY_PRESET: str = "ctrl+f7"
     HOTKEY_SET_PRESET: str = "ctrl+alt+shift+f7"
 
+    # OCR / Translation Prompt
     SYSTEM_PROMPT: str = (
         "You are a strict OCR + translation engine. Look at the image, "
         "find any foreign-language text or chat content in it, and "
@@ -182,7 +230,7 @@ def setup_dpi_awareness():
 
 
 # ==========================================================================
-# GEMINI TRANSLATION WORKER
+# TRANSLATION ENGINES (Gemini & Groq)
 # ==========================================================================
 class GeminiTranslator:
     def __init__(self, cfg: Config):
@@ -191,22 +239,16 @@ class GeminiTranslator:
 
     def _ensure_configured(self):
         if genai is None:
-            raise RuntimeError(
-                "google-genai is not installed. "
-                "Run: pip install google-genai"
-            )
+            raise RuntimeError("google-genai is not installed. Run: pip install google-genai")
         if self.client is None:
-            if not self.cfg.GEMINI_API_KEY or "YOUR_GEMINI_API_KEY" in self.cfg.GEMINI_API_KEY:
-                raise RuntimeError(
-                    "No valid Gemini API key set. Set the GEMINI_API_KEY "
-                    "environment variable or edit CONFIG.GEMINI_API_KEY."
-                )
+            if not self.cfg.GEMINI_API_KEY:
+                raise RuntimeError("No Gemini API key set in GEMINI_API_KEY (.env).")
             self.client = genai.Client(api_key=self.cfg.GEMINI_API_KEY)
 
     def translate_image(self, image: Image.Image) -> str:
         self._ensure_configured()
-
         last_error: Optional[Exception] = None
+
         for model_name in self.cfg.GEMINI_MODELS:
             try:
                 print(f"[Gemini] Sending image to {model_name}...")
@@ -227,14 +269,108 @@ class GeminiTranslator:
                 if text:
                     print(f"[Gemini] Success with model: {model_name}")
                     return text
-                else:
-                    raise ValueError("Empty response text")
+                raise ValueError("Empty response text")
             except Exception as e:
                 print(f"[Gemini] Model '{model_name}' failed: {e}")
                 last_error = e
                 continue
 
         raise RuntimeError(f"All Gemini models failed. Last error: {last_error}")
+
+
+class GroqTranslator:
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+        self.client = None
+
+    def _ensure_configured(self):
+        if Groq is None:
+            raise RuntimeError("groq is not installed. Run: pip install groq")
+        if self.client is None:
+            if not self.cfg.GROQ_API_KEY:
+                raise RuntimeError("No Groq API key set in GROQ_API_KEY (.env).")
+            self.client = Groq(api_key=self.cfg.GROQ_API_KEY)
+
+    def translate_image(self, image: Image.Image) -> str:
+        self._ensure_configured()
+
+        # Convert PIL image to base64 JPEG
+        buf = io.BytesIO()
+        rgb_image = image.convert("RGB") if image.mode in ("RGBA", "LA", "P") else image
+        rgb_image.save(buf, format="JPEG", quality=85)
+        base64_image = base64.b64encode(buf.getvalue()).decode("utf-8")
+        data_url = f"data:image/jpeg;base64,{base64_image}"
+
+        last_error: Optional[Exception] = None
+        for model_name in self.cfg.GROQ_MODELS:
+            try:
+                print(f"[Groq] Sending image to {model_name}...")
+                params = {
+                    "model": model_name,
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": self.cfg.SYSTEM_PROMPT},
+                                {"type": "image_url", "image_url": {"url": data_url}},
+                            ],
+                        }
+                    ],
+                    "temperature": 0.1,
+                }
+
+                # Hide internal thinking traces for reasoning models (e.g., Qwen 3.8)
+                try:
+                    completion = self.client.chat.completions.create(
+                        reasoning_format="hidden", **params
+                    )
+                except Exception:
+                    completion = self.client.chat.completions.create(**params)
+
+                content = (completion.choices[0].message.content or "").strip()
+                # Clean up any stray <think> tags if returned
+                content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
+
+                if content:
+                    print(f"[Groq] Success with model: {model_name}")
+                    return content
+                raise ValueError("Empty response text")
+            except Exception as e:
+                print(f"[Groq] Model '{model_name}' failed: {e}")
+                last_error = e
+                continue
+
+        raise RuntimeError(f"All Groq models failed. Last error: {last_error}")
+
+
+class TranslationManager:
+    """Dispatches requests to the active service defined in CONFIG.SERVICE."""
+
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+        self.gemini = GeminiTranslator(cfg)
+        self.groq = GroqTranslator(cfg)
+
+    def translate_image(self, image: Image.Image) -> str:
+        service = (self.cfg.SERVICE or "gemini").lower().strip()
+
+        if service == "groq":
+            return self.groq.translate_image(image)
+        elif service == "gemini":
+            return self.gemini.translate_image(image)
+        elif service in ("auto", "all", "fallback"):
+            # Try Groq first, then Gemini
+            if self.cfg.GROQ_API_KEY:
+                try:
+                    return self.groq.translate_image(image)
+                except Exception as e:
+                    print(f"[Auto Fallback] Groq failed ({e}). Trying Gemini...")
+                    return self.gemini.translate_image(image)
+            return self.gemini.translate_image(image)
+        else:
+            raise ValueError(
+                f"Unknown SERVICE '{service}' in .env. Supported: 'groq', 'gemini', 'auto'"
+            )
 
 
 # ==========================================================================
@@ -276,7 +412,6 @@ class SnipOverlay:
         self._closed = False
 
         self.screenshot = ScreenCapture.grab_fullscreen()
-
         self.start_x = None
         self.start_y = None
         self.rect_id = None
@@ -318,28 +453,27 @@ class SnipOverlay:
         bar_text = (
             "SET PRESET REGION: Drag box to save  |  Right-click or ESC to cancel"
             if is_preset else
-            "DRAG TO SELECT REGION  |  Right-click or ESC to cancel"
+            f"DRAG TO SELECT REGION ({CONFIG.SERVICE.upper()})  |  Right-click or ESC to cancel"
         )
         bar_color = CONFIG.OVERLAY_PRESET_COLOR if is_preset else CONFIG.OVERLAY_SELECTION_COLOR
 
         self.canvas.create_rectangle(0, 0, win_w, 36, fill="#121212", outline="")
         self.canvas.create_text(
-            win_w // 2, 18, text=bar_text, fill=bar_color,
-            font=("Segoe UI", 11, "bold")
+            win_w // 2, 18, text=bar_text, fill=bar_color, font=("Segoe UI", 11, "bold")
         )
 
-        # Drag selection
+        # Mouse Events
         self.canvas.bind("<ButtonPress-1>", self._on_press)
         self.canvas.bind("<B1-Motion>", self._on_drag)
         self.canvas.bind("<ButtonRelease-1>", self._on_release)
 
-        # Right-click cancels capture without passing event down
+        # Right-click cancels cleanly without passing down to focused app
         self.canvas.bind("<ButtonPress-3>", self._swallow_event)
         self.win.bind("<ButtonPress-3>", self._swallow_event)
         self.canvas.bind("<ButtonRelease-3>", self._on_right_click)
         self.win.bind("<ButtonRelease-3>", self._on_right_click)
 
-        # ESC key cancels capture
+        # ESC cancels capture
         self.win.bind("<Escape>", self._on_escape)
         self.win.protocol("WM_DELETE_WINDOW", self._on_escape)
         self.win.focus_force()
@@ -361,12 +495,10 @@ class SnipOverlay:
 
         color = CONFIG.OVERLAY_PRESET_COLOR if self.mode == "preset" else CONFIG.OVERLAY_SELECTION_COLOR
         self.rect_id = self.canvas.create_rectangle(
-            self.start_x, self.start_y, self.start_x, self.start_y,
-            outline=color, width=2
+            self.start_x, self.start_y, self.start_x, self.start_y, outline=color, width=2
         )
         self.label_id = self.canvas.create_text(
-            self.start_x + 8, self.start_y + 14,
-            text="0 x 0", fill=color, anchor="nw",
+            self.start_x + 8, self.start_y + 14, text="0 x 0", fill=color, anchor="nw",
             font=("Segoe UI", 10, "bold")
         )
 
@@ -418,7 +550,7 @@ class SnipOverlay:
 
 
 # ==========================================================================
-# RESULT POPUP WINDOW (Remember Position & Size + Font from Config)
+# RESULT POPUP WINDOW (Streamlined Text Display)
 # ==========================================================================
 class ResultWindow:
     def __init__(self, root: tk.Tk, text: str, is_error: bool = False):
@@ -432,7 +564,7 @@ class ResultWindow:
             pass
         self.win.configure(bg="#181818")
 
-        # Load position & size from config
+        # Position and size memory
         win_cfg = PERSISTENT_CONFIG.get("result_window", {})
         w = win_cfg.get("width", 580)
         h = win_cfg.get("height", 360)
@@ -450,14 +582,11 @@ class ResultWindow:
         self._last_x = x
         self._last_y = y
 
-        # Track movements & resizes
         self.win.bind("<Configure>", self._on_configure)
 
-        # Dynamic font size (reads directly from config)
         font_size = PERSISTENT_CONFIG.get("result_font_size", 12)
-
-        # Text area fills almost 100% of the window
         text_fg = "#f28b82" if is_error else "#f0f0f0"
+
         self.text_area = scrolledtext.ScrolledText(
             self.win,
             wrap="word",
@@ -476,7 +605,7 @@ class ResultWindow:
         self.text_area.insert("1.0", text)
         self.text_area.configure(state="disabled")
 
-        # Slim Bottom Action Bar
+        # Bottom Bar
         btn_frame = tk.Frame(self.win, bg="#181818")
         btn_frame.pack(fill="x", padx=10, pady=(0, 10))
 
@@ -573,8 +702,7 @@ def _build_tray_icon_image() -> Image.Image:
     text = "T"
     bbox = draw.textbbox((0, 0), text, font=font)
     tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
-    draw.text(((size - tw) / 2 - bbox[0], (size - th) / 2 - bbox[1]), text,
-               fill="#00c8ff", font=font)
+    draw.text(((size - tw) / 2 - bbox[0], (size - th) / 2 - bbox[1]), text, fill="#00c8ff", font=font)
     return img
 
 
@@ -601,19 +729,13 @@ class TrayIcon:
             return
         image = _build_tray_icon_image()
         menu = pystray.Menu(
-            pystray.MenuItem(
-                f"Snip now  ({self.app.cfg.HOTKEY_SNIP.upper()})", self._on_snip
-            ),
-            pystray.MenuItem(
-                f"Preset capture  ({self.app.cfg.HOTKEY_PRESET.upper()})", self._on_preset
-            ),
-            pystray.MenuItem(
-                f"Set preset area  ({self.app.cfg.HOTKEY_SET_PRESET.upper()})", self._on_set_preset
-            ),
+            pystray.MenuItem(f"Snip now ({self.app.cfg.HOTKEY_SNIP.upper()})", self._on_snip),
+            pystray.MenuItem(f"Preset capture ({self.app.cfg.HOTKEY_PRESET.upper()})", self._on_preset),
+            pystray.MenuItem(f"Set preset area ({self.app.cfg.HOTKEY_SET_PRESET.upper()})", self._on_set_preset),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Quit", self._on_quit),
         )
-        self.icon = pystray.Icon("screen_translate", image, "Screen Translate", menu)
+        self.icon = pystray.Icon("screen_translate", image, f"Screen Translate ({self.app.cfg.SERVICE})", menu)
         self.icon.run()
 
     def stop(self):
@@ -630,7 +752,7 @@ class TrayIcon:
 class ScreenTranslateApp:
     def __init__(self, cfg: Config):
         self.cfg = cfg
-        self.translator = GeminiTranslator(cfg)
+        self.translator = TranslationManager(cfg)
 
         self.root = tk.Tk()
         self.root.withdraw()
@@ -644,7 +766,7 @@ class ScreenTranslateApp:
         self.tray = TrayIcon(self)
         if pystray is not None:
             threading.Thread(target=self.tray.start, daemon=True).start()
-            print("[Tray] System tray icon active.")
+            print(f"[Tray] System tray active (Service: {self.cfg.SERVICE.upper()}).")
 
         self.root.after(50, self._poll_queue)
 
@@ -660,7 +782,7 @@ class ScreenTranslateApp:
         print(f"[Hotkeys] '{self.cfg.HOTKEY_SNIP}' -> interactive snip")
         print(f"[Hotkeys] '{self.cfg.HOTKEY_PRESET}' -> preset region capture")
         print(f"[Hotkeys] '{self.cfg.HOTKEY_SET_PRESET}' -> set preset region")
-        print("[Hotkeys] Ready.")
+        print(f"[Service] Active translation provider: {self.cfg.SERVICE.upper()}")
 
     def _request_interactive_snip(self):
         self.event_queue.put(("start_interactive_snip", None))
@@ -782,11 +904,14 @@ def main():
     required_missing = []
     if keyboard is None:
         required_missing.append("keyboard")
-    if genai is None:
+    if CONFIG.SERVICE in ("gemini", "auto") and genai is None:
         required_missing.append("google-genai")
+    if CONFIG.SERVICE in ("groq", "auto") and Groq is None:
+        required_missing.append("groq")
+
     if required_missing:
         print(
-            "[WARN] Missing required dependencies: "
+            "[WARN] Missing required dependencies for selected service: "
             + ", ".join(required_missing)
             + "\n       Install with: pip install " + " ".join(required_missing)
         )
